@@ -1,0 +1,23 @@
+  1. Install base dependencies:
+  sudo apt-get install -y build-essential libssl-dev libnghttp2-dev zlib1g-dev libcjson-dev
+
+  2. Build & install a current cJSON from source (Ubuntu's packaged cJSON is too old — your code needs the newer bool-returning API):
+  cd /tmp
+  git clone --depth 1 https://github.com/DaveGamble/cJSON.git
+  cd cJSON && mkdir build && cd build
+  cmake .. -DENABLE_CJSON_UTILS=Off -DENABLE_CJSON_TEST=Off -DCMAKE_INSTALL_PREFIX=/usr/local
+  make -j4
+  sudo make install
+  sudo ldconfig
+
+  3. Build seppd itself, pointing at OpenSSL 3.5 (system default is 1.1.1, too old for SSL_get1_peer_certificate):
+  cd /home/mhoang/Desktop/Mantis/sepp/seppd
+  OPENSSL_CFLAGS="-I/opt/openssl-3.5/include" \
+  OPENSSL_LDFLAGS="-L/opt/openssl-3.5/lib64 -Wl,-rpath,/opt/openssl-3.5/lib64 -lssl -lcrypto" \
+  make
+
+  4. Verify:
+  ls -la seppd
+  ldd seppd
+  You should see a seppd binary in the directory, linking against /opt/openssl-3.5/lib64/libssl.so.3 and /usr/local/lib/libcjson.so.1 with no missing libraries.
+

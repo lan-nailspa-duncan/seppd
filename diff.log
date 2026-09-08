@@ -1,0 +1,526 @@
+diff --git a/config/seppd.json b/config/seppd.json
+index 146abd6..182419e 100644
+--- a/config/seppd.json
++++ b/config/seppd.json
+@@ -1,6 +1,6 @@
+ {
+-  "local_plmn": "00101",
+-  "local_fqdn": "sepp.operator-a.com",
++  "local_plmn": "99970",
++  "local_fqdn": "sepp1.localdomain",
+   "log_level": "DEBUG",
+ 
+   "tls": {
+@@ -12,9 +12,9 @@
+   "listeners": [
+     {
+       "role": "internal_sbi",
+-      "address": "127.0.0.1",
+-      "port": 8443,
+-      "require_client_certificate": true,
++      "address": "127.0.1.250",
++      "port": 7777,
++      "require_client_certificate": false,
+       "external_certificate_verification": false,
+       "tls": {
+         "certificate": "../certs/seppd.crt",
+@@ -24,14 +24,15 @@
+     },
+     {
+       "role": "external_n32",
+-      "address": "0.0.0.0",
+-      "port": 443,
++      "address": "172.19.140.80",
++      "port": 7777,
+       "require_client_certificate": true,
+-      "external_certificate_verification": true,
++      "external_certificate_verification": false,
+       "tls": {
+         "certificate": "../certs/seppd.crt",
+         "private_key": "../certs/seppd.key",
+-        "ca_bundle": "../certs/ca.crt"
++        "ca_bundle": "../certs/ca.crt",
++        "sslkeylogfile": "/tmp/seppd_sslkeylog.log"
+       }
+     }
+   ],
+@@ -43,9 +44,8 @@
+     "timeout_ms": 3000
+   },
+ 
+-
+   "ocsp": {
+-    "client_request_server_stapling": true,
++    "client_request_server_stapling": false,
+     "server_stapling": {
+       "enabled": false,
+       "response_file": "../certs/seppd.ocsp.der"
+@@ -55,38 +55,46 @@
+   "internal_routing": {
+     "mode": "direct",
+     "served_domains": [
+-      "*.operator-a.com",
+-      "*.mnc001.mcc001.3gppnetwork.org"
++      "*.mnc070.mcc999.3gppnetwork.org"
+     ]
+   },
+ 
+   "targets": [
+     {
+-      "name": "peer-sepp-a",
++      "name": "sepp2",
+       "type": "peer_sepp",
+-      "plmn": "00102",
+-      "fqdn": "sepp.operator-b.com",
+-      "port": 443,
++      "plmn": "00101",
++      "fqdn": "sepp2.localdomain",
++      "port": 7777,
++      "n32f_port": 7778,
+       "served_domains": [
+-        "*.operator-b.com",
+-        "*.mnc002.mcc001.3gppnetwork.org"
++        "*.mnc001.mcc001.3gppnetwork.org",
++        "sepp2.localdomain"
+       ],
+-      "external_certificate_verification": true
++      "external_certificate_verification": false
+     },
+     {
+-      "name": "scp-1",
+-      "type": "scp",
+-      "fqdn": "scp.local",
+-      "port": 443,
++      "name": "ausf-1",
++      "type": "nf",
++      "nf_type": "AUSF",
++      "fqdn": "ausf.5gc.mnc070.mcc999.3gppnetwork.org",
++      "port": 80,
++      "external_certificate_verification": false
++    },
++    {
++      "name": "udm-1",
++      "type": "nf",
++      "nf_type": "UDM",
++      "fqdn": "udm.5gc.mnc070.mcc999.3gppnetwork.org",
++      "port": 80,
+       "external_certificate_verification": false
+     },
+     {
+       "name": "smf-1",
+       "type": "nf",
+       "nf_type": "SMF",
+-      "nf_instance_id": "smf-0001",
+-      "fqdn": "smf.local",
+-      "port": 443,
++      "fqdn": "smf.5gc.mnc070.mcc999.3gppnetwork.org",
++      "port": 80,
+       "external_certificate_verification": false
+     }
+   ]
+diff --git a/include/config.h b/include/config.h
+index 9fd47ba..1c4ee28 100644
+--- a/include/config.h
++++ b/include/config.h
+@@ -34,6 +34,7 @@ struct sepp_tls_config {
+     char certificate[SEPP_CONFIG_PATH_LEN];
+     char private_key[SEPP_CONFIG_PATH_LEN];
+     char ca_bundle[SEPP_CONFIG_PATH_LEN];
++    char sslkeylogfile[SEPP_CONFIG_PATH_LEN]; /* optional NSS keylog output */
+ };
+ 
+ struct sepp_listener_config {
+@@ -64,6 +65,7 @@ struct sepp_target_config {
+     char plmn[SEPP_CONFIG_PLMN_LEN];
+     char fqdn[SEPP_CONFIG_FQDN_LEN];
+     uint16_t port;
++    uint16_t n32f_port; /* peer_sepp only; 0 means "same as port" */
+     char nf_type[SEPP_CONFIG_NF_TYPE_LEN];
+     char nf_instance_id[SEPP_CONFIG_NF_ID_LEN];
+     int external_certificate_verification;
+diff --git a/include/peer.h b/include/peer.h
+index 438deb1..a190162 100644
+--- a/include/peer.h
++++ b/include/peer.h
+@@ -36,6 +36,7 @@ enum sepp_security_capability {
+ struct sepp_peer_ctx {
+     struct sepp_target_key target;
+     uint16_t port;
++    uint16_t configured_n32f_port; /* from target config; falls back to port */
+     char plmn[SEPP_PEER_PLMN_LEN];
+ 
+     /* Peer identities received during N32-C capability negotiation. */
+diff --git a/src/config.c b/src/config.c
+index d4ac6a2..a303104 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -221,6 +221,10 @@ static void parse_tls_object(cJSON *tls, struct sepp_tls_config *cfg)
+                  "ca_bundle",
+                  cfg->ca_bundle,
+                  sizeof(cfg->ca_bundle));
++    parse_string(tls,
++                 "sslkeylogfile",
++                 cfg->sslkeylogfile,
++                 sizeof(cfg->sslkeylogfile));
+ }
+ 
+ static void parse_tls(cJSON *root, sepp_config_t *cfg)
+@@ -454,6 +458,7 @@ static int parse_targets(cJSON *root, sepp_config_t *cfg)
+                      target->nf_instance_id,
+                      sizeof(target->nf_instance_id));
+         parse_u16(item, "port", &target->port);
++        parse_u16(item, "n32f_port", &target->n32f_port);
+         parse_bool(item,
+                    "external_certificate_verification",
+                    &target->external_certificate_verification);
+@@ -691,7 +696,7 @@ void config_dump(const sepp_config_t *cfg)
+     for (int i = 0; i < cfg->target_count; i++) {
+         const struct sepp_target_config *target = &cfg->targets[i];
+ 
+-        printf("target[%d]: name=%s type=%s plmn=%s nf_type=%s nf_instance_id=%s fqdn=%s:%u external_certificate_verification=%s\n",
++        printf("target[%d]: name=%s type=%s plmn=%s nf_type=%s nf_instance_id=%s fqdn=%s:%u n32f_port=%u external_certificate_verification=%s\n",
+                i,
+                target->name,
+                sepp_target_type_name(target->type),
+@@ -700,6 +705,7 @@ void config_dump(const sepp_config_t *cfg)
+                target->nf_instance_id,
+                target->fqdn,
+                (unsigned int)target->port,
++               (unsigned int)(target->n32f_port ? target->n32f_port : target->port),
+                target->external_certificate_verification ? "yes" : "no");
+         for (int j = 0; j < target->served_domain_count; j++)
+             printf("  served_domain[%d]=%s\n", j, target->served_domains[j]);
+diff --git a/src/connector.c b/src/connector.c
+index 6dcaaca..6afaf05 100644
+--- a/src/connector.c
++++ b/src/connector.c
+@@ -173,6 +173,12 @@ static struct sepp_conn *connector_connect_type(
+         type == SEPP_CONN_TYPE_UNKNOWN)
+         return NULL;
+ 
++    SEPP_DEBUG("connector: dialing type=%s target_fqdn=%s host=%s port=%u",
++               sepp_conn_type_name(type),
++               target->fqdn,
++               host,
++               (unsigned int)port);
++
+     memset(&hints, 0, sizeof(hints));
+     hints.ai_family = AF_UNSPEC;
+     hints.ai_socktype = SOCK_STREAM;
+diff --git a/src/n32c.c b/src/n32c.c
+index d0c3d47..3102030 100644
+--- a/src/n32c.c
++++ b/src/n32c.c
+@@ -293,6 +293,52 @@ static int n32c_bind_inbound_peer(struct sepp_context *ctx,
+     return 0;
+ }
+ 
++/* Splits local_plmn ("<3-digit mcc><2-or-3-digit mnc>", e.g. "99970")
++ * into a one-element plmnIdList array and attaches it to root. Peers use
++ * this to learn which PLMN(s) we serve via sepp_node_find_by_plmn_id()-
++ * style lookups derived purely from the N32-C handshake body, with no
++ * NRF involvement on their side. Returns 0 on success (including when
++ * local_plmn is unset, in which case nothing is added), -1 on failure. */
++static int n32c_add_local_plmn_list(const struct sepp_context *ctx,
++                                    cJSON *root)
++{
++    cJSON *plmn_list;
++    cJSON *plmn_entry;
++    char mcc[4];
++    const char *mnc;
++    size_t len;
++
++    if (!ctx || !root)
++        return -1;
++
++    len = strlen(ctx->config.local_plmn);
++    if (len < 5 || len > 6)
++        return 0;
++
++    memcpy(mcc, ctx->config.local_plmn, 3);
++    mcc[3] = '\0';
++    mnc = ctx->config.local_plmn + 3;
++
++    plmn_list = cJSON_CreateArray();
++    plmn_entry = cJSON_CreateObject();
++    if (!plmn_list || !plmn_entry) {
++        cJSON_Delete(plmn_list);
++        cJSON_Delete(plmn_entry);
++        return -1;
++    }
++
++    if (!cJSON_AddStringToObject(plmn_entry, "mcc", mcc) ||
++        !cJSON_AddStringToObject(plmn_entry, "mnc", mnc) ||
++        !cJSON_AddItemToArray(plmn_list, plmn_entry)) {
++        cJSON_Delete(plmn_list);
++        cJSON_Delete(plmn_entry);
++        return -1;
++    }
++
++    cJSON_AddItemToObject(root, "plmnIdList", plmn_list);
++    return 0;
++}
++
+ static char *n32c_build_capability_request(const struct sepp_context *ctx,
+                                            const char *capability)
+ {
+@@ -328,6 +374,11 @@ static char *n32c_build_capability_request(const struct sepp_context *ctx,
+         return NULL;
+     }
+ 
++    if (n32c_add_local_plmn_list(ctx, root) != 0) {
++        cJSON_Delete(root);
++        return NULL;
++    }
++
+     body = cJSON_PrintUnformatted(root);
+     cJSON_Delete(root);
+     return body;
+@@ -407,6 +458,12 @@ static char *n32c_build_capability_response(const struct sepp_context *ctx,
+         return NULL;
+     }
+ 
++    if (strcmp(selected, "TLS") == 0 &&
++        n32c_add_local_plmn_list(ctx, root) != 0) {
++        cJSON_Delete(root);
++        return NULL;
++    }
++
+     body = cJSON_PrintUnformatted(root);
+     cJSON_Delete(root);
+     return body;
+@@ -439,7 +496,7 @@ static int n32c_complete_tls_teardown(struct sepp_context *ctx,
+              sizeof(peer->n32f_peer_fqdn),
+              "%s",
+              peer->target.fqdn);
+-    peer->n32f_peer_port = peer->port;
++    peer->n32f_peer_port = peer->configured_n32f_port;
+     peer->n32c_redirect_count = 0;
+     peer->selected_security = SEPP_SECURITY_CAPABILITY_UNKNOWN;
+     peer->negotiated_features = 0;
+@@ -468,6 +525,10 @@ static int n32c_handle_exchange_capability_request(
+     int rc;
+ 
+     body = sepp_msg_body_for_inspection(msg, &body_len);
++    SEPP_DEBUG("n32c: rx exchange-capability request body (%zu bytes): %.*s",
++               body_len,
++               (int)body_len,
++               body ? (const char *)body : "");
+     root = cJSON_ParseWithLength((const char *)body, body_len);
+     if (!root)
+         return n32c_send_json_response(msg, 400, "{\"error\":\"invalid_json\"}\n");
+@@ -488,6 +549,15 @@ static int n32c_handle_exchange_capability_request(
+         !n32c_parse_supported_features(supported_features, &nftlst) ||
+         (target_api_root_supported &&
+          !cJSON_IsBool(target_api_root_supported))) {
++        SEPP_DEBUG("n32c: rejecting exchange-capability request: "
++                   "sender_valid=%d senderN32fFqdn_valid=%d caps_is_array=%d "
++                   "features_valid=%d target_api_root_type_valid=%d",
++                   n32c_fqdn_ie_valid(sender, 1),
++                   n32c_fqdn_ie_valid(sender_n32f_fqdn, 0),
++                   cJSON_IsArray(caps),
++                   n32c_parse_supported_features(supported_features, &nftlst),
++                   !target_api_root_supported ||
++                       cJSON_IsBool(target_api_root_supported));
+         cJSON_Delete(root);
+         return n32c_send_json_response(msg,
+                                        400,
+@@ -765,7 +835,10 @@ static int n32c_handle_exchange_capability_response(
+     snprintf(peer->n32f_peer_fqdn, sizeof(peer->n32f_peer_fqdn), "%s",
+              sender_n32f_fqdn ? sender_n32f_fqdn->valuestring
+                               : peer->n32c_peer_fqdn);
+-    peer->n32f_peer_port = peer->n32c_peer_port;
++    /* 3GPP TS 29.573 carries no N32-f port in the handshake response; use
++     * our own locally configured N32-f port for this peer (falls back to
++     * the N32-c port when the peer co-locates both roles on one port). */
++    peer->n32f_peer_port = peer->configured_n32f_port;
+     peer->n32c_redirect_count = 0;
+     cJSON_Delete(root);
+ 
+@@ -832,6 +905,11 @@ int sepp_n32c_on_conn_ready(struct sepp_context *ctx, struct sepp_conn *conn)
+     if (!peer)
+         return -1;
+ 
++    SEPP_DEBUG("n32c: conn ready for peer %s on fd %d, current state=%s",
++               peer->target.fqdn,
++               conn->fd,
++               sepp_n32c_state_name(peer->n32c_state));
++
+     teardown = peer->n32c_state == SEPP_N32C_STATE_TERMINATING;
+     if (peer->n32c_state == SEPP_N32C_STATE_EXCHANGE_CAPABILITY ||
+         peer->n32c_state == SEPP_N32C_STATE_ESTABLISHED)
+diff --git a/src/peer.c b/src/peer.c
+index dcb9b8d..920d2e6 100644
+--- a/src/peer.c
++++ b/src/peer.c
+@@ -40,6 +40,7 @@ static struct sepp_peer_ctx *peer_alloc(const struct sepp_target_config *cfg,
+ 
+     memcpy(&peer->target, key, sizeof(peer->target));
+     peer->port = cfg->port;
++    peer->configured_n32f_port = cfg->n32f_port ? cfg->n32f_port : cfg->port;
+     snprintf(peer->n32c_peer_fqdn, sizeof(peer->n32c_peer_fqdn), "%s",
+              key->fqdn);
+     peer->n32c_peer_port = cfg->port;
+@@ -47,7 +48,7 @@ static struct sepp_peer_ctx *peer_alloc(const struct sepp_target_config *cfg,
+              "/n32c-handshake/v1/exchange-capability");
+     snprintf(peer->n32f_peer_fqdn, sizeof(peer->n32f_peer_fqdn), "%s",
+              key->fqdn);
+-    peer->n32f_peer_port = cfg->port;
++    peer->n32f_peer_port = peer->configured_n32f_port;
+     snprintf(peer->plmn, sizeof(peer->plmn), "%s", cfg->plmn);
+     peer->n32c_state = SEPP_N32C_STATE_IDLE;
+     peer->selected_security = SEPP_SECURITY_CAPABILITY_UNKNOWN;
+diff --git a/src/routing.c b/src/routing.c
+index 11f0f0d..ff3dbfb 100644
+--- a/src/routing.c
++++ b/src/routing.c
+@@ -9,7 +9,9 @@
+ #include "target.h"
+ 
+ #define ROUTING_SCHEME_HTTPS "https://"
++#define ROUTING_SCHEME_HTTP  "http://"
+ #define ROUTING_DEFAULT_HTTPS_PORT 443u
++#define ROUTING_DEFAULT_HTTP_PORT  80u
+ 
+ int sepp_routing_parse_api_root(const char *api_root,
+                                 char *fqdn,
+@@ -19,18 +21,34 @@ int sepp_routing_parse_api_root(const char *api_root,
+     const char *host;
+     const char *end;
+     const char *colon;
+-    unsigned int parsed_port = ROUTING_DEFAULT_HTTPS_PORT;
++    unsigned int parsed_port;
++    size_t scheme_len;
+     size_t host_len;
+ 
+     if (!api_root || !fqdn || fqdn_len == 0 || !port)
+         return -1;
+ 
++    /* Real deployments (e.g. open5gs) use the target NF's own internal
++     * scheme in 3gpp-Sbi-Target-apiRoot, which is commonly plain HTTP for
++     * intra-PLMN calls, regardless of the TLS-protected N32-f transport
++     * this value travels over. Accept both; the outbound connection to
++     * the resolved target is always made over TLS by the connector
++     * (see connector.c), so this does not weaken transport security. */
+     if (strncmp(api_root,
+                 ROUTING_SCHEME_HTTPS,
+-                sizeof(ROUTING_SCHEME_HTTPS) - 1u) != 0)
++                sizeof(ROUTING_SCHEME_HTTPS) - 1u) == 0) {
++        scheme_len = sizeof(ROUTING_SCHEME_HTTPS) - 1u;
++        parsed_port = ROUTING_DEFAULT_HTTPS_PORT;
++    } else if (strncmp(api_root,
++                       ROUTING_SCHEME_HTTP,
++                       sizeof(ROUTING_SCHEME_HTTP) - 1u) == 0) {
++        scheme_len = sizeof(ROUTING_SCHEME_HTTP) - 1u;
++        parsed_port = ROUTING_DEFAULT_HTTP_PORT;
++    } else {
+         return -1;
++    }
+ 
+-    host = api_root + sizeof(ROUTING_SCHEME_HTTPS) - 1u;
++    host = api_root + scheme_len;
+     if (*host == '\0')
+         return -1;
+ 
+@@ -177,12 +195,17 @@ int sepp_routing_internal_from_api_root(struct sepp_context *ctx,
+         return -1;
+     }
+ 
++    SEPP_DEBUG("routing: direct-mode lookup for apiRoot=%s (parsed fqdn=%s port=%u)",
++               api_root, fqdn, (unsigned int)port);
++
+     for (int i = 0; i < ctx->config.target_count; i++) {
+         const struct sepp_target_config *candidate = &ctx->config.targets[i];
+ 
+         if (candidate->type != SEPP_TARGET_INTERNAL_NF ||
+             candidate->port != port || strcasecmp(candidate->fqdn, fqdn) != 0)
+             continue;
++        SEPP_DEBUG("routing: matched direct internal NF target name=%s fqdn=%s:%u",
++                   candidate->name, candidate->fqdn, (unsigned int)candidate->port);
+         if (sepp_target_from_config(candidate, key) != 0)
+             return -1;
+         if (cfg)
+diff --git a/src/tls_channel.c b/src/tls_channel.c
+index a29aec5..666f981 100644
+--- a/src/tls_channel.c
++++ b/src/tls_channel.c
+@@ -352,7 +352,31 @@ static int tls_drive_handshake(struct sepp_conn *conn)
+         return status;
+ 
+     tls->handshake_done = 1;
+-    SEPP_INFO("TLS handshake complete on fd %d", conn->fd);
++    {
++        const char *version = SSL_get_version(tls->ssl);
++        const SSL_CIPHER *cipher = SSL_get_current_cipher(tls->ssl);
++        const char *cipher_name = cipher ? SSL_CIPHER_get_name(cipher) : "?";
++        const unsigned char *alpn = NULL;
++        unsigned int alpn_len = 0;
++        X509 *peer_cert = SSL_get1_peer_certificate(tls->ssl);
++        char peer_subject[256] = "none";
++
++        SSL_get0_alpn_selected(tls->ssl, &alpn, &alpn_len);
++        if (peer_cert) {
++            X509_NAME_oneline(X509_get_subject_name(peer_cert),
++                              peer_subject, sizeof(peer_subject));
++            X509_free(peer_cert);
++        }
++
++        SEPP_DEBUG("TLS handshake complete on fd %d: version=%s cipher=%s "
++                   "alpn=%.*s peer_subject=%s",
++                   conn->fd,
++                   version ? version : "?",
++                   cipher_name,
++                   (int)alpn_len,
++                   alpn ? (const char *)alpn : "",
++                   peer_subject);
++    }
+ 
+     return tls_start_external_verify(conn);
+ }
+@@ -593,6 +617,32 @@ static int tls_load_ocsp_response(struct sepp_context *ctx,
+     return 0;
+ }
+ 
++/* NSS key log format writer, consumed by Wireshark/tshark's
++ * tls.keylog_file preference for offline decryption of captures. */
++static void tls_keylog_callback(const SSL *ssl, const char *line)
++{
++    SSL_CTX *ctx;
++    const char *path;
++    FILE *f;
++
++    ctx = SSL_get_SSL_CTX(ssl);
++    if (!ctx)
++        return;
++
++    path = (const char *)SSL_CTX_get_app_data(ctx);
++    if (!path || path[0] == '\0')
++        return;
++
++    f = fopen(path, "a");
++    if (!f) {
++        SEPP_ERROR("failed to open SSL key log file: %s", path);
++        return;
++    }
++
++    fprintf(f, "%s\n", line);
++    fclose(f);
++}
++
+ static SSL_CTX *tls_new_ctx(const struct sepp_tls_config *config,
+                             int server,
+                             int require_client_certificate)
+@@ -607,6 +657,13 @@ static SSL_CTX *tls_new_ctx(const struct sepp_tls_config *config,
+     if (!ssl_ctx)
+         return NULL;
+ 
++    if (config->sslkeylogfile[0] != '\0') {
++        /* app_data must outlive the SSL_CTX; config lives in the process's
++         * static/heap-owned sepp_config_t for the daemon's lifetime. */
++        SSL_CTX_set_app_data(ssl_ctx, (void *)config->sslkeylogfile);
++        SSL_CTX_set_keylog_callback(ssl_ctx, tls_keylog_callback);
++    }
++
+     SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
+ 
+     if (config->certificate[0] != '\0' &&

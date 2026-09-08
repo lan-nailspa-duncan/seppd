@@ -1,0 +1,121 @@
+###############
+Restart seppd
+
+ps aux | grep "seppd" 
+sudo pkill -f "bin/open5gs-seppd"
+
+sudo pkill -9 -f "\./seppd" 2>/dev/null
+sudo ./seppd
+
+###############
+
+ ############# Force to resend N32-c ###############
+   1. Find and stop the current process
+
+  ssh mhoang@172.19.140.82 'ps aux | grep open5gs-seppd | grep -v grep'
+
+  Kill it by name:
+  ssh mhoang@172.19.140.82 'sudo pkill -f "bin/open5gs-seppd"'
+
+  2. Verify it's stopped
+
+  ssh mhoang@172.19.140.82 'ps aux | grep open5gs-seppd | grep -v grep || echo "stopped"'
+
+  3. Start it again
+
+
+  cd ~/open5gs/install
+  sudo bin/open5gs-seppd -c etc/open5gs/pc2-visited.yaml -D > /home/mhoang/open5gs/logs/sepp.log 2>&1 &
+  disown
+
+  
+  ###########################################
+
+
+1. Rebuild after any code change
+
+  cd /home/mhoang/Desktop/Mantis/sepp/seppd
+  OPENSSL_CFLAGS="-I/opt/openssl-3.5/include" \
+  OPENSSL_LDFLAGS="-L/opt/openssl-3.5/lib64 -Wl,-rpath,/opt/openssl-3.5/lib64 -lssl -lcrypto" \
+  make
+
+  2. Stop PC1's real open5gs-seppd (frees the real addresses)
+
+  sudo pkill -f "bin/open5gs-seppd"
+
+  3. Start your seppd in its place
+
+  Config path is hardcoded to config/seppd.json, so you must run it from inside the seppd/ directory. Run it with stdbuf -oL so debug output isn't fully-buffered when redirected to a file — otherwise a
+  crash or kill can lose everything still sitting in the buffer:
+
+  cd /home/mhoang/Desktop/Mantis/sepp/seppd
+  sudo stdbuf -oL -eL ./seppd > /tmp/seppd_pc1.log 2>&1 &
+  disown
+
+  Or skip the redirect and just watch it live in the foreground (Ctrl-C to stop):
+  cd /home/mhoang/Desktop/Mantis/sepp/seppd
+  sudo ./seppd
+
+  Confirm both listeners came up:
+  sudo tail -20 /tmp/seppd_pc1.log
+  You should see internal_sbi listener active on 127.0.1.250:7777 and external_n32 listener active on 172.19.140.80:7777.
+
+  4. Force PC3 to (re)attempt the N32-c handshake
+
+  PC3's SEPP only detects PC1 went away when it actually tries to use the connection — it won't proactively notice a plain restart. Force a fresh attempt by bouncing PC3's SEPP:
+
+  ssh mhoang@172.19.140.43 'sudo pkill -f "bin/open5gs-seppd"'
+  sleep 2
+  ssh mhoang@172.19.140.43 'cd ~/open5gs/install && sudo bin/open5gs-seppd -c etc/open5gs/pc2-visited.yaml -D > /home/mhoang/open5gs/logs/sepp.log 2>&1 & disown'
+
+  5. Watch the debug trace live
+
+  In a separate terminal on PC1:
+  sudo tail -f /tmp/seppd_pc1.log
+  Within a few seconds you should see the inbound connection, TLS handshake detail (version/cipher/ALPN/peer cert subject), and the parsed N32-c capability-exchange body — confirm with:
+  grep "SEPP established\|SEPP -f/tmp/seppd_pc1.log
+  Or just watch for N32-C exchange-capability request accepted from sepp2.localdomain; selected TLS.
+
+  6. Trigger real N32-f traffic
+
+  ssh mhoang@172.19.140.43 'sudo pkill -9 -f "tests/registration/registration" 2>/dev/null; cd ~/open5gs && sudo timeout 20 build/tests/registration/registration -c 
+  build/configs/examples/gnb-001-01-ue-999-70.yaml simple-test'
+  Watch /tmp/seppd_pc1.log for the routing/connector trace lines (connector: dialing..., routing: direct-mode lookup...) as the forwarded calls arrive.
+
+  7. Extra debug output: live object counters
+
+  Your code already wires up SIGUSR2 for live counters (peer contexts, connections, TLS channels, etc.) without stopping the daemon:
+  sudo kill -USR2 $(pgrep -x seppd)
+  sudo tail -30 /tmp/seppd_pc1.log
+
+  8. When done — restore PC1 to the real open5gs-seppd
+
+  sudo pkill -f "^\./seppd$|/seppd$"   # or kill the PID shown by `ps aux | grep seppd`
+  cd /home/mhoang/open5gs/install
+  sudo bin/open5gs-seppd -c etc/open5gs/pc1-home.yaml -D > /home/mhoang/open5gs/logs/sepp.log 2>&1 &
+  disown
+  Verify with ps aux | grep "bin/open5gs-seppd" and tail /home/mhoang/open5gs/logs/sepp.log for SEPP established.
+
+  Reminder on what to expect
+
+  - N32-c handshake with PC3 will succeed (this is the part we already verified working).
+  - The registration test will still fail at the AUSF-auth step, because PC3's own SEPP can't find a peer for PLMN 999/70 without NRF discovery (Gap A — seppd doesn't self-register in NRF yet). That
+  failure happens on PC3's side before it even calls you, so it won't show up in your trace at all — don't mistake trace silence after the handshake for a bug on your end.
+
+
+
+
+
+############################################ Decode ############################################
+ 1. Pull PC3's key log 
+
+  ssh mhoang@172.19.140.43 'sudo cp ~/open5gs/logs/sslkeylog.log /tmp/sslkeylog-pc3.log && sudo chmod 644 /tmp/sslkeylog-pc3.log'
+  scp mhoang@172.19.140.43:/tmp/sslkeylog-pc3.log /home/mhoang/Desktop/Mantis/sepp/sslkeylog-n32c.log
+
+  2. Point Wireshark/tshark at it
+
+  Wireshark: open your N32-c pcap → Edit → Preferences → Protocols → TLS → (Pre)-Master-Secret log filename → sslkeylog-n32c.log. Filter on http2.
+
+
+
+
