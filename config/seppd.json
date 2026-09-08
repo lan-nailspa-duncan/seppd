@@ -1,0 +1,101 @@
+{
+  "local_plmn": "99970",
+  "local_fqdn": "sepp1.localdomain",
+  "log_level": "DEBUG",
+
+  "tls": {
+    "certificate": "../certs/seppd.crt",
+    "private_key": "../certs/seppd.key",
+    "ca_bundle": "../certs/ca.crt"
+  },
+
+  "listeners": [
+    {
+      "role": "internal_sbi",
+      "address": "127.0.1.250",
+      "port": 7777,
+      "require_client_certificate": false,
+      "external_certificate_verification": false,
+      "tls": {
+        "certificate": "../certs/seppd.crt",
+        "private_key": "../certs/seppd.key",
+        "ca_bundle": "../certs/ca.crt"
+      }
+    },
+    {
+      "role": "external_n32",
+      "address": "172.19.140.80",
+      "port": 7777,
+      "require_client_certificate": true,
+      "external_certificate_verification": false,
+      "tls": {
+        "certificate": "../certs/seppd.crt",
+        "private_key": "../certs/seppd.key",
+        "ca_bundle": "../certs/ca.crt",
+        "sslkeylogfile": "/tmp/seppd_sslkeylog.log"
+      }
+    }
+  ],
+
+  "certificate_verifier": {
+    "enabled": false,
+    "local_socket": "/tmp/seppd-certverify.sock",
+    "peer_socket": "/tmp/sepp-certverifier.sock",
+    "timeout_ms": 3000
+  },
+
+  "ocsp": {
+    "client_request_server_stapling": false,
+    "server_stapling": {
+      "enabled": false,
+      "response_file": "../certs/seppd.ocsp.der"
+    }
+  },
+
+  "internal_routing": {
+    "mode": "direct",
+    "served_domains": [
+      "*.mnc070.mcc999.3gppnetwork.org"
+    ]
+  },
+
+  "targets": [
+    {
+      "name": "sepp2",
+      "type": "peer_sepp",
+      "plmn": "00101",
+      "fqdn": "sepp2.localdomain",
+      "port": 7777,
+      "n32f_port": 7778,
+      "served_domains": [
+        "*.mnc001.mcc001.3gppnetwork.org",
+        "sepp2.localdomain"
+      ],
+      "external_certificate_verification": false
+    },
+    {
+      "name": "ausf-1",
+      "type": "nf",
+      "nf_type": "AUSF",
+      "fqdn": "ausf.5gc.mnc070.mcc999.3gppnetwork.org",
+      "port": 80,
+      "external_certificate_verification": false
+    },
+    {
+      "name": "udm-1",
+      "type": "nf",
+      "nf_type": "UDM",
+      "fqdn": "udm.5gc.mnc070.mcc999.3gppnetwork.org",
+      "port": 80,
+      "external_certificate_verification": false
+    },
+    {
+      "name": "smf-1",
+      "type": "nf",
+      "nf_type": "SMF",
+      "fqdn": "smf.5gc.mnc070.mcc999.3gppnetwork.org",
+      "port": 80,
+      "external_certificate_verification": false
+    }
+  ]
+}
